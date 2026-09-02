@@ -30,6 +30,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -47,7 +48,10 @@ import kotlinx.coroutines.launch
 data class AppInfo(
     val appName: String,
     val packageName: String,
-    val isSelected: Boolean = false
+    val isSelected: Boolean = false,
+    // Valores de configuração por app, lidos do banco pra mostrar na tela.
+    val dailyBudgetMinutes: Int = 0,
+    val cooldownMinutes: Int = 0
 )
 
 class AppSelectionViewModel(private val blockedAppDao: BlockedAppDao, private val application: Application) : ViewModel() {
@@ -119,8 +123,16 @@ class AppSelectionViewModel(private val blockedAppDao: BlockedAppDao, private va
                 .sortedBy { it.appName.lowercase() }
 
             blockedAppDao.getAllBlockedApps().collect { blockedApps ->
-                val blockedAppPackages = blockedApps.map { it.packageName }.toSet()
-                _apps.value = baseAppList.map { it.copy(isSelected = blockedAppPackages.contains(it.packageName)) }
+                // Indexa as fichas bloqueadas pelo pacote pra puxar orçamento/cooldown de cada uma.
+                val blockedByPackage = blockedApps.associateBy { it.packageName }
+                _apps.value = baseAppList.map { info ->
+                    val blocked = blockedByPackage[info.packageName]
+                    info.copy(
+                        isSelected = blocked != null,
+                        dailyBudgetMinutes = blocked?.dailyBudgetMinutes ?: 0,
+                        cooldownMinutes = blocked?.cooldownMinutes ?: 0
+                    )
+                }
             }
         }
     }
@@ -132,6 +144,16 @@ class AppSelectionViewModel(private val blockedAppDao: BlockedAppDao, private va
             } else {
                 blockedAppDao.delete(BlockedApp(packageName = app.packageName))
             }
+        }
+    }
+
+    // Salva orçamento e cooldown de um app. Garante que ele está bloqueado antes (insert é IGNORE,
+    // então não sobrescreve quem já existe), depois grava os dois valores.
+    fun onAppLimitsChanged(app: AppInfo, budgetMinutes: Int, cooldownMinutes: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            blockedAppDao.insert(BlockedApp(packageName = app.packageName))
+            blockedAppDao.setBudgetMinutes(app.packageName, budgetMinutes)
+            blockedAppDao.setCooldownMinutes(app.packageName, cooldownMinutes)
         }
     }
 
@@ -199,6 +221,9 @@ class AppSelectionActivity : ComponentActivity() {
                         onAppCheckedChange = { app, isSelected ->
                             viewModel.onAppSelectionChanged(app, isSelected)
                         },
+                        onAppLimitsChanged = { app, budget, cooldown ->
+                            viewModel.onAppLimitsChanged(app, budget, cooldown)
+                        },
                         modifier = Modifier.padding(padding)
                     )
                 }
@@ -211,6 +236,7 @@ class AppSelectionActivity : ComponentActivity() {
 fun AppSelectionScreen(
     apps: List<AppInfo>,
     onAppCheckedChange: (AppInfo, Boolean) -> Unit,
+    onAppLimitsChanged: (AppInfo, Int, Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -226,6 +252,9 @@ fun AppSelectionScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
+
+    // Qual app está com o diálogo de configuração aberto (null = nenhum).
+    var configuringApp by remember { mutableStateOf<AppInfo?>(null) }
 
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val filteredApps = remember(apps, searchQuery) {
@@ -251,17 +280,103 @@ fun AppSelectionScreen(
                     onCheckedChange = { isSelected ->
                         onAppCheckedChange(app, isSelected)
                     },
+                    onConfigureClick = { configuringApp = app },
                     isEnabled = !isServiceRunning
                 )
             }
         }
     }
+
+    // Diálogo de configuração de limites, aberto ao tocar no ícone de ajuste de um app.
+    val editing = configuringApp
+    if (editing != null) {
+        LimitsDialog(
+            app = editing,
+            onDismiss = { configuringApp = null },
+            onSave = { budget, cooldown ->
+                onAppLimitsChanged(editing, budget, cooldown)
+                configuringApp = null
+            }
+        )
+    }
+}
+
+@Composable
+fun LimitsDialog(
+    app: AppInfo,
+    onDismiss: () -> Unit,
+    onSave: (Int, Int) -> Unit
+) {
+    // Campos começam com os valores atuais do app (ou vazio se for 0 / não configurado).
+    var budgetText by rememberSaveable {
+        mutableStateOf(if (app.dailyBudgetMinutes > 0) app.dailyBudgetMinutes.toString() else "")
+    }
+    var cooldownText by rememberSaveable {
+        mutableStateOf(if (app.cooldownMinutes > 0) app.cooldownMinutes.toString() else "")
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(app.appName) },
+        text = {
+            Column {
+                Text(
+                    "Deixe em branco (ou 0) para bloqueio total, sem orçamento.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = budgetText,
+                    onValueChange = { new -> budgetText = new.filter { it.isDigit() } },
+                    label = { Text("Orçamento diário (minutos)") },
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = KeyboardType.Number
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = cooldownText,
+                    onValueChange = { new -> cooldownText = new.filter { it.isDigit() } },
+                    label = { Text("Cooldown (minutos, 0 = só a tag)") },
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = KeyboardType.Number
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Ex: 180 minutos = 3 horas de espera.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val budget = budgetText.toIntOrNull() ?: 0
+                val cooldown = cooldownText.toIntOrNull() ?: 0
+                onSave(budget, cooldown)
+            }) {
+                Text("Salvar")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancelar")
+            }
+        }
+    )
 }
 
 @Composable
 fun AppListItem(
     app: AppInfo,
     onCheckedChange: (Boolean) -> Unit,
+    onConfigureClick: () -> Unit,
     isEnabled: Boolean
 ) {
     val context = LocalContext.current
@@ -291,12 +406,36 @@ fun AppListItem(
             modifier = Modifier.size(48.dp)
         )
         Spacer(modifier = Modifier.width(16.dp))
-        Text(
-            text = app.appName,
-            style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(modifier = Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = app.appName,
+                style = MaterialTheme.typography.bodyLarge
+            )
+            // Resumo dos limites configurados, só aparece pra app selecionado com orçamento.
+            if (app.isSelected && app.dailyBudgetMinutes > 0) {
+                val resumo = buildString {
+                    append("${app.dailyBudgetMinutes} min/dia")
+                    if (app.cooldownMinutes > 0) {
+                        append(" · espera ${app.cooldownMinutes} min")
+                    } else {
+                        append(" · só a tag")
+                    }
+                }
+                Text(
+                    text = resumo,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        // Botão de configurar limites, habilitado só quando o app está selecionado.
+        TextButton(
+            onClick = onConfigureClick,
+            enabled = isEnabled && app.isSelected
+        ) {
+            Text("Limites")
+        }
         Checkbox(
             checked = app.isSelected,
             onCheckedChange = onCheckedChange,
@@ -304,4 +443,3 @@ fun AppListItem(
         )
     }
 }
-
