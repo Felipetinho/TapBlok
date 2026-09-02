@@ -38,6 +38,11 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import coil.compose.rememberAsyncImagePainter
+import com.cj.tapblok.database.AppDatabase
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import com.cj.tapblok.ui.theme.TapBlokTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
@@ -93,6 +98,7 @@ class BlockingActivity : ComponentActivity() {
             TapBlokTheme {
                 BlockingScreen(
                     packageName = packageName,
+                    blockedPackageId = blockedPackage,
                     strictMode = strictMode,
                     unlockMinutes = unlockMinutes,
                     onGoHomeClick = goHome,
