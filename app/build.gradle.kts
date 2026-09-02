@@ -28,16 +28,25 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(localProps.getProperty("RELEASE_STORE_FILE", ""))
-            storePassword = localProps.getProperty("RELEASE_STORE_PASSWORD", "")
-            keyAlias = localProps.getProperty("RELEASE_KEY_ALIAS", "")
-            keyPassword = localProps.getProperty("RELEASE_KEY_PASSWORD", "")
+            // Só configura a assinatura de release se a chave existir (máquina do autor).
+            // No GitHub Actions, sem a chave, esse bloco é pulado e o build de debug segue normal.
+            val storeFilePath = localProps.getProperty("RELEASE_STORE_FILE", "")
+            if (storeFilePath.isNotBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = localProps.getProperty("RELEASE_STORE_PASSWORD", "")
+                keyAlias = localProps.getProperty("RELEASE_KEY_ALIAS", "")
+                keyPassword = localProps.getProperty("RELEASE_KEY_PASSWORD", "")
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            // Usa a assinatura de release só quando ela foi configurada (chave presente).
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
             isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
