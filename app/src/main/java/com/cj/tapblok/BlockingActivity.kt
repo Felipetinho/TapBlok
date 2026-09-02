@@ -169,6 +169,7 @@ class BlockingActivity : ComponentActivity() {
 @Composable
 fun BlockingScreen(
     packageName: String,
+    blockedPackageId: String?,
     strictMode: Boolean,
     unlockMinutes: Int,
     onGoHomeClick: () -> Unit,
@@ -180,6 +181,32 @@ fun BlockingScreen(
     var appName by remember { mutableStateOf(packageName) }
     var appIcon by remember { mutableStateOf<Drawable?>(null) }
     var breaksRemaining by rememberSaveable { mutableStateOf(0) }
+
+    // Quanto tempo falta pro cooldown acabar, em milissegundos. -1 = não é bloqueio de cooldown.
+    var cooldownRemainingMillis by remember { mutableStateOf(-1L) }
+
+    // Enquanto a tela estiver aberta, recalcula o tempo restante do cooldown a cada segundo.
+    LaunchedEffect(blockedPackageId) {
+        if (blockedPackageId == null) return@LaunchedEffect
+        while (true) {
+            val row = withContext(Dispatchers.IO) {
+                AppDatabase.getDatabase(context).blockedAppDao()
+                    .getAllBlockedAppsList()
+                    .firstOrNull { it.packageName == blockedPackageId }
+            }
+            cooldownRemainingMillis = if (
+                row != null && row.lockedUntilScan &&
+                row.cooldownMinutes > 0 && row.lockedAtMillis > 0
+            ) {
+                val cooldownMillis = row.cooldownMinutes * 60_000L
+                val elapsed = System.currentTimeMillis() - row.lockedAtMillis
+                (cooldownMillis - elapsed).coerceAtLeast(0L)
+            } else {
+                -1L
+            }
+            delay(1000)
+        }
+    }
 
     LaunchedEffect(key1 = Unit) {
         val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
@@ -257,11 +284,28 @@ fun BlockingScreen(
             Spacer(modifier = Modifier.height(12.dp))
 
             Text(
-                text = if (strictMode) {
-                    "Tap your NFC tag or scan your QR code to unlock $appName for " +
+                text = when {
+                    // Bloqueio por cooldown: mostra o tempo que falta, atualizando a cada segundo.
+                    cooldownRemainingMillis > 0 -> {
+                        val totalSeconds = cooldownRemainingMillis / 1000
+                        val hours = totalSeconds / 3600
+                        val minutes = (totalSeconds % 3600) / 60
+                        val seconds = totalSeconds % 60
+                        val tempo = when {
+                            hours > 0 -> "${hours}h ${minutes}min"
+                            minutes > 0 -> "${minutes}min ${seconds}s"
+                            else -> "${seconds}s"
+                        }
+                        "Tempo esgotado. Faltam $tempo — aguarde ou use sua tag para liberar agora."
+                    }
+                    // Cooldown zerou mas a tela ainda não fechou: já pode liberar.
+                    cooldownRemainingMillis == 0L ->
+                        "Liberado! Feche esta tela e abra o app novamente."
+                    strictMode ->
+                        "Tap your NFC tag or scan your QR code to unlock $appName for " +
                             "$unlockMinutes minute${if (unlockMinutes != 1) "s" else ""}."
-                } else {
-                    "Tap your NFC tag or scan your QR code to unlock."
+                    else ->
+                        "Tap your NFC tag or scan your QR code to unlock."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
