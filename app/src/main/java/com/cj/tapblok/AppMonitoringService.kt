@@ -15,6 +15,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.edit
 import com.cj.tapblok.database.AppDatabase
+import com.cj.tapblok.database.BlockedApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
@@ -27,12 +28,15 @@ class AppMonitoringService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO)
     private lateinit var db: AppDatabase
     private lateinit var prefs: android.content.SharedPreferences
-    @Volatile private var blockedApps: Set<String> = emptySet()
+    // Fichas completas dos apps bloqueados, indexadas pelo nome do pacote.
+    @Volatile private var blockedAppRows: Map<String, BlockedApp> = emptyMap()
     @Volatile private var isBreakActive = false
     private var isMonitoring = false
     private var breakTimer: CountDownTimer? = null
     private var lastEventTimestamp = 0L
     private var currentForegroundApp: String? = null
+    // Momento da última "batida" do loop, pra medir quanto tempo se passou entre uma e outra.
+    private var lastTickTimestamp = 0L
     // Strict mode: apps granted a timed unlock, package -> expiry epoch millis
     private val temporarilyUnlockedApps = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
@@ -43,6 +47,7 @@ class AppMonitoringService : Service() {
         const val ACTION_UNLOCK_APP = "com.cj.tapblok.ACTION_UNLOCK_APP"
         const val EXTRA_UNLOCK_PACKAGE = "com.cj.tapblok.extra.UNLOCK_PACKAGE"
         private const val INITIAL_EVENT_LOOKBACK_MS = 60 * 60 * 1000L
+        private const val MS_PER_DAY = 86_400_000L
         @Volatile var isRunning = false
     }
 
@@ -98,11 +103,12 @@ class AppMonitoringService : Service() {
 
         if (isMonitoring) return START_STICKY
         isMonitoring = true
+        lastTickTimestamp = System.currentTimeMillis()
 
         serviceScope.launch {
             db.blockedAppDao().getAllBlockedApps().collect { list ->
-                blockedApps = list.map { it.packageName }.toSet()
-                if (BuildConfig.DEBUG) Log.d("AppMonitoringService", "Blocked apps updated from DB: $blockedApps")
+                blockedAppRows = list.associateBy { it.packageName }
+                if (BuildConfig.DEBUG) Log.d("AppMonitoringService", "Blocked apps updated from DB: ${blockedAppRows.keys}")
             }
         }
 
@@ -120,9 +126,16 @@ class AppMonitoringService : Service() {
                     val foregroundApp = getForegroundApp()
                     if (BuildConfig.DEBUG) Log.d("AppMonitoringService", "Current App: $foregroundApp")
 
-                    if (foregroundApp != null && foregroundApp in blockedApps &&
-                        foregroundApp != packageName && !isTemporarilyUnlocked(foregroundApp)
-                    ) {
+                    val now = System.currentTimeMillis()
+                    val elapsed = (now - lastTickTimestamp).coerceAtLeast(0L)
+                    lastTickTimestamp = now
+
+                    val shouldBlock = foregroundApp != null &&
+                        foregroundApp != packageName &&
+                        !isTemporarilyUnlocked(foregroundApp) &&
+                        evaluateForegroundApp(foregroundApp, elapsed)
+
+                    if (shouldBlock && foregroundApp != null) {
                         val blockIntent = Intent(localContext, BlockingActivity::class.java).apply {
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             putExtra("BLOCKED_APP_PACKAGE_NAME", foregroundApp)
@@ -141,6 +154,48 @@ class AppMonitoringService : Service() {
         }
 
         return START_STICKY
+    }
+
+    // Decide se o app em foreground deve ser bloqueado agora.
+    // Também soma o tempo de uso e cuida da trava/cooldown, como efeito colateral.
+    private suspend fun evaluateForegroundApp(foregroundApp: String, elapsedMillis: Long): Boolean {
+        val row = blockedAppRows[foregroundApp] ?: return false
+
+        // Sem orçamento configurado: bloqueio total, comportamento antigo.
+        if (row.dailyBudgetMinutes <= 0) return true
+
+        val now = System.currentTimeMillis()
+        val todayEpochDay = now / MS_PER_DAY
+
+        // Se já está travado, checa se o cooldown terminou.
+        if (row.lockedUntilScan) {
+            val cooldownMillis = row.cooldownMinutes * 60_000L
+            // cooldownMinutes == 0 significa "só a tag libera" — nunca destrava sozinho.
+            if (cooldownMillis > 0 && row.lockedAtMillis > 0 &&
+                now - row.lockedAtMillis >= cooldownMillis
+            ) {
+                // Cooldown acabou: destrava sozinho e começa um período novo.
+                db.blockedAppDao().clearLock(foregroundApp)
+                return false
+            }
+            // Ainda em cooldown (ou modo só-tag): continua bloqueado.
+            return true
+        }
+
+        // Não está travado. Vira um novo dia? Zera o tempo usado.
+        var usedMillis = if (row.lastResetEpochDay != todayEpochDay) 0L else row.usedMillisToday
+        usedMillis += elapsedMillis
+
+        val budgetMillis = row.dailyBudgetMinutes * 60_000L
+        if (usedMillis >= budgetMillis) {
+            // Estourou o orçamento: trava e marca o horário (o cooldown conta a partir daqui).
+            db.blockedAppDao().lockApp(foregroundApp, now)
+            return true
+        }
+
+        // Ainda dentro do orçamento: salva o tempo acumulado e libera.
+        db.blockedAppDao().updateUsage(foregroundApp, usedMillis, todayEpochDay)
+        return false
     }
 
     private fun isTemporarilyUnlocked(packageName: String): Boolean {
