@@ -11,6 +11,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.lifecycle.lifecycleScope
+import com.cj.tapblok.database.AppDatabase
+import kotlinx.coroutines.launch
 
 class NfcHandlerActivity : ComponentActivity() {
 
@@ -51,6 +54,10 @@ class NfcHandlerActivity : ComponentActivity() {
     }
 
     private fun handleValidTag() {
+        // A trava de orçamento é independente do liga/desliga da sessão e do modo estrito:
+        // qualquer scan válido limpa o(s) app(s) que atingiram o orçamento diário.
+        clearBudgetLocks()
+
         if (!isServiceRunning(this, AppMonitoringService::class.java)) {
             startMonitoringService(this)
             Toast.makeText(this, "Monitoring started.", Toast.LENGTH_SHORT).show()
@@ -70,6 +77,15 @@ class NfcHandlerActivity : ComponentActivity() {
                 Toast.makeText(this, "Strict mode: open TapBlok, then scan again to stop.", Toast.LENGTH_LONG).show()
                 showStrictModeNotification()
             }
+        }
+    }
+
+    private fun clearBudgetLocks() {
+        lifecycleScope.launch {
+            val dao = AppDatabase.getDatabase(this@NfcHandlerActivity).blockedAppDao()
+            dao.getAllBlockedAppsList()
+                .filter { it.lockedUntilScan }
+                .forEach { dao.clearLock(it.packageName) }
         }
     }
 
