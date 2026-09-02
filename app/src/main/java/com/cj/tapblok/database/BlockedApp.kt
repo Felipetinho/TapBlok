@@ -13,7 +13,13 @@ data class BlockedApp(
     val usedMillisToday: Long = 0,
     // Dia (em "epoch day") em que os contadores acima foram zerados pela última vez.
     val lastResetEpochDay: Long = 0,
-    // Vira true quando o orçamento do dia acabou; só um scan NFC libera.
-    val lockedUntilScan: Boolean = false
+    // Vira true quando o orçamento do dia acabou. Libera com a tag OU quando o cooldown termina.
+    val lockedUntilScan: Boolean = false,
+    // Tempo de espera (em minutos) até o app destravar sozinho depois que o orçamento acaba.
+    // 0 = sem cooldown automático (só a tag libera).
+    val cooldownMinutes: Int = 0,
+    // Momento (System.currentTimeMillis()) em que a trava começou. 0 = não está travado.
+    // É a partir daqui que o cooldown é contado.
+    val lockedAtMillis: Long = 0
 )
 
